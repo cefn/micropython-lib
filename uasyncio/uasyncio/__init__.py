@@ -73,38 +73,51 @@ class PollEventLoop(EventLoop):
         if res:
             for sock, ev in res:
                 cb = self.objmap[id(sock)]
+                if ev & (select.POLLHUP | select.POLLERR):
+                    # These events are returned even if not requested, and
+                    # are sticky, i.e. will be returned again and again.
+                    # If the caller doesn't do proper error handling and
+                    # unregister this sock, we'll busy-loop on it, so we
+                    # as well can unregister it now "just in case".
+                    self.remove_reader(sock)
                 if DEBUG and __debug__:
                     log.debug("Calling IO callback: %r", cb)
                 if isinstance(cb, tuple):
                     cb[0](*cb[1])
                 else:
+                    cb.pend_throw(None)
                     self.call_soon(cb)
 
 
 class StreamReader:
 
-    def __init__(self, s):
-        self.s = s
+    def __init__(self, polls, ios=None):
+        if ios is None:
+            ios = polls
+        self.polls = polls
+        self.ios = ios
 
     def read(self, n=-1):
         while True:
-            yield IORead(self.s)
-            res = self.s.read(n)
+            yield IORead(self.polls)
+            res = self.ios.read(n)
             if res is not None:
                 break
-            log.warn("Empty read")
+            # This should not happen for real sockets, but can easily
+            # happen for stream wrappers (ssl, websockets, etc.)
+            #log.warn("Empty read")
         if not res:
-            yield IOReadDone(self.s)
+            yield IOReadDone(self.polls)
         return res
 
     def readexactly(self, n):
         buf = b""
         while n:
-            yield IORead(self.s)
-            res = self.s.read(n)
+            yield IORead(self.polls)
+            res = self.ios.read(n)
             assert res is not None
             if not res:
-                yield IOReadDone(self.s)
+                yield IOReadDone(self.polls)
                 break
             buf += res
             n -= len(res)
@@ -115,11 +128,11 @@ class StreamReader:
             log.debug("StreamReader.readline()")
         buf = b""
         while True:
-            yield IORead(self.s)
-            res = self.s.readline()
+            yield IORead(self.polls)
+            res = self.ios.readline()
             assert res is not None
             if not res:
-                yield IOReadDone(self.s)
+                yield IOReadDone(self.polls)
                 break
             buf += res
             if buf[-1] == 0x0a:
@@ -129,11 +142,11 @@ class StreamReader:
         return buf
 
     def aclose(self):
-        yield IOReadDone(self.s)
-        self.s.close()
+        yield IOReadDone(self.polls)
+        self.ios.close()
 
     def __repr__(self):
-        return "<StreamReader %r>" % self.s
+        return "<StreamReader %r %r>" % (self.polls, self.ios)
 
 
 class StreamWriter:
@@ -187,15 +200,15 @@ class StreamWriter:
         return "<StreamWriter %r>" % self.s
 
 
-def open_connection(host, port):
+def open_connection(host, port, ssl=False):
     if DEBUG and __debug__:
         log.debug("open_connection(%s, %s)", host, port)
-    s = _socket.socket()
+    ai = _socket.getaddrinfo(host, port, 0, _socket.SOCK_STREAM)
+    ai = ai[0]
+    s = _socket.socket(ai[0], ai[1], ai[2])
     s.setblocking(False)
-    ai = _socket.getaddrinfo(host, port)
-    addr = ai[0][4]
     try:
-        s.connect(addr)
+        s.connect(ai[-1])
     except OSError as e:
         if e.args[0] != uerrno.EINPROGRESS:
             raise
@@ -206,19 +219,26 @@ def open_connection(host, port):
 #        assert s2.fileno() == s.fileno()
     if DEBUG and __debug__:
         log.debug("open_connection: After iowait: %s", s)
+    if ssl:
+        print("Warning: uasyncio SSL support is alpha")
+        import ussl
+        s.setblocking(True)
+        s2 = ussl.wrap_socket(s)
+        s.setblocking(False)
+        return StreamReader(s, s2), StreamWriter(s2, {})
     return StreamReader(s), StreamWriter(s, {})
 
 
 def start_server(client_coro, host, port, backlog=10):
     if DEBUG and __debug__:
         log.debug("start_server(%s, %s)", host, port)
-    s = _socket.socket()
+    ai = _socket.getaddrinfo(host, port, 0, _socket.SOCK_STREAM)
+    ai = ai[0]
+    s = _socket.socket(ai[0], ai[1], ai[2])
     s.setblocking(False)
 
-    ai = _socket.getaddrinfo(host, port)
-    addr = ai[0][4]
     s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-    s.bind(addr)
+    s.bind(ai[-1])
     s.listen(backlog)
     while True:
         if DEBUG and __debug__:

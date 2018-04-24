@@ -50,12 +50,12 @@ def request(method, url, data=None, json=None, headers={}, stream=None):
         host, port = host.split(":", 1)
         port = int(port)
 
-    ai = usocket.getaddrinfo(host, port)
-    addr = ai[0][-1]
+    ai = usocket.getaddrinfo(host, port, 0, usocket.SOCK_STREAM)
+    ai = ai[0]
 
-    s = usocket.socket()
+    s = usocket.socket(ai[0], ai[1], ai[2])
     try:
-        s.connect(addr)
+        s.connect(ai[-1])
         if proto == "https:":
             s = ussl.wrap_socket(s, server_hostname=host)
         s.write(b"%s /%s HTTP/1.0\r\n" % (method, path))
@@ -71,6 +71,7 @@ def request(method, url, data=None, json=None, headers={}, stream=None):
             assert data is None
             import ujson
             data = ujson.dumps(json)
+            s.write(b"Content-Type: application/json\r\n")
         if data:
             s.write(b"Content-Length: %d\r\n" % len(data))
         s.write(b"\r\n")
@@ -78,9 +79,12 @@ def request(method, url, data=None, json=None, headers={}, stream=None):
             s.write(data)
 
         l = s.readline()
-        protover, status, msg = l.split(None, 2)
-        status = int(status)
-        #print(protover, status, msg)
+        #print(l)
+        l = l.split(None, 2)
+        status = int(l[1])
+        reason = ""
+        if len(l) > 2:
+            reason = l[2].rstrip()
         while True:
             l = s.readline()
             if not l or l == b"\r\n":
@@ -97,7 +101,7 @@ def request(method, url, data=None, json=None, headers={}, stream=None):
 
     resp = Response(s)
     resp.status_code = status
-    resp.reason = msg.rstrip()
+    resp.reason = reason
     return resp
 
 

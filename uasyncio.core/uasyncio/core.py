@@ -15,10 +15,22 @@ def set_debug(val):
         log = logging.getLogger("uasyncio.core")
 
 
+class CancelledError(Exception):
+    pass
+
+
+class TimeoutError(CancelledError):
+    pass
+
+
 class EventLoop:
 
     def __init__(self, len=42):
         self.q = utimeq.utimeq(len)
+        # Current task being run. Task is a top-level coroutine scheduled
+        # in the event loop (sub-coroutines executed transparently by
+        # yield from/await, event loop "doesn't see" them).
+        self.cur_task = None
 
     def time(self):
         return time.ticks_ms()
@@ -72,6 +84,7 @@ class EventLoop:
                 args = cur_task[2]
                 if __debug__ and DEBUG:
                     log.debug("Next coroutine to run: %s", (t, cb, args))
+                self.cur_task = cb
 #                __main__.mem_info()
             else:
                 self.wait(-1)
@@ -95,9 +108,11 @@ class EventLoop:
                         if isinstance(ret, SleepMs):
                             delay = arg
                         elif isinstance(ret, IORead):
+                            cb.pend_throw(False)
                             self.add_reader(arg, cb)
                             continue
                         elif isinstance(ret, IOWrite):
+                            cb.pend_throw(False)
                             self.add_writer(arg, cb)
                             continue
                         elif isinstance(ret, IOReadDone):
@@ -116,11 +131,18 @@ class EventLoop:
                     elif ret is None:
                         # Just reschedule
                         pass
+                    elif ret is False:
+                        # Don't reschedule
+                        continue
                     else:
                         assert False, "Unsupported coroutine yield value: %r (of type %r)" % (ret, type(ret))
                 except StopIteration as e:
                     if __debug__ and DEBUG:
                         log.debug("Coroutine finished: %s", cb)
+                    continue
+                except CancelledError as e:
+                    if __debug__ and DEBUG:
+                        log.debug("Coroutine cancelled: %s", cb)
                     continue
                 # Currently all syscalls don't return anything, so we don't
                 # need to feed anything to the next invocation of coroutine.
@@ -210,6 +232,44 @@ class SleepMs(SysCall1):
 
 _stop_iter = StopIteration()
 sleep_ms = SleepMs()
+
+
+def cancel(coro):
+    prev = coro.pend_throw(CancelledError())
+    if prev is False:
+        _event_loop.call_soon(coro)
+
+
+class TimeoutObj:
+    def __init__(self, coro):
+        self.coro = coro
+
+
+def wait_for_ms(coro, timeout):
+
+    def waiter(coro, timeout_obj):
+        res = yield from coro
+        if __debug__ and DEBUG:
+            log.debug("waiter: cancelling %s", timeout_obj)
+        timeout_obj.coro = None
+        return res
+
+    def timeout_func(timeout_obj):
+        if timeout_obj.coro:
+            if __debug__ and DEBUG:
+                log.debug("timeout_func: cancelling %s", timeout_obj.coro)
+            prev = timeout_obj.coro.pend_throw(TimeoutError())
+            #print("prev pend", prev)
+            if prev is False:
+                _event_loop.call_soon(timeout_obj.coro)
+
+    timeout_obj = TimeoutObj(_event_loop.cur_task)
+    _event_loop.call_later_ms(timeout, timeout_func, timeout_obj)
+    return (yield from waiter(coro, timeout_obj))
+
+
+def wait_for(coro, timeout):
+    return wait_for_ms(coro, int(timeout * 1000))
 
 
 def coroutine(f):
